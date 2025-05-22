@@ -83,7 +83,7 @@ use {
 ///
 /// ```ignore
 /// use carbon_proc_macros::CarbonDeserialize;
-/// 
+///
 /// #[derive(CarbonDeserialize)]
 /// #[carbon(discriminator = "0x01")]
 /// struct Message {
@@ -143,12 +143,24 @@ pub fn carbon_deserialize_derive(input_token_stream: TokenStream) -> TokenStream
                 }
 
 
-                let (disc, rest) = data.split_at(discriminator.len());
+                let (disc, mut rest) = data.split_at(discriminator.len());
                 if disc != discriminator {
                     return None;
                 }
 
-                 carbon_core::borsh::BorshDeserialize::try_from_slice(rest).ok()
+                 match carbon_core::borsh::BorshDeserialize::deserialize(&mut rest) {
+                    Ok(res) => {
+                        if !rest.is_empty() {
+                            carbon_core::log::warn!(
+                                "Not all bytes were read when deserializing {}: {} bytes remaining",
+                                stringify!(#name),
+                                rest.len(),
+                            );
+                        }
+                        Some(res)
+                    }
+                    Err(_) => None,
+                }
             }
         }
     };
@@ -176,7 +188,7 @@ pub fn carbon_deserialize_derive(input_token_stream: TokenStream) -> TokenStream
 ///
 /// ```ignore
 /// use carbon_proc_macros::CarbonDeserialize;
-/// 
+///
 /// #[derive(CarbonDeserialize)]
 /// #[carbon(discriminator = "0x1234")]
 /// struct MyStruct {
@@ -217,7 +229,7 @@ pub fn carbon_deserialize_derive(input_token_stream: TokenStream) -> TokenStream
 fn gen_borsh_deserialize(input: TokenStream) -> TokenStream2 {
     let cratename = Ident::new("borsh", Span::call_site());
 
-    let item: Item = syn::parse(input).unwrap();
+    let item: Item = syn::parse(input).expect("Failed to parse input");
     let res = match item {
         Item::Struct(item) => struct_de(&item, cratename),
         Item::Enum(item) => enum_de(&item, cratename),
@@ -253,7 +265,7 @@ fn gen_borsh_deserialize(input: TokenStream) -> TokenStream2 {
 ///
 /// ```ignore
 /// use syn::Attribute;
-/// 
+///
 /// // Example attribute with a discriminator
 /// let attrs: Vec<Attribute> = vec![parse_quote!(#[carbon(discriminator = "0x1234")])];
 /// let discriminator = get_discriminator(&attrs);
@@ -344,7 +356,7 @@ fn get_discriminator(attrs: &[syn::Attribute]) -> Option<quote::__private::Token
 /// ```ignore
 /// use syn::Ident;
 /// use syn::parse_quote;
-/// 
+///
 /// let instructions_enum_name: Ident = parse_quote!(InstructionsEnum);
 /// let instruction_types_enum_name: Ident = parse_quote!(InstructionTypesEnum);
 /// let programs_enum_name: Ident = parse_quote!(ProgramsEnum);
@@ -632,7 +644,12 @@ pub fn instruction_decoder_collection(input: TokenStream) -> TokenStream {
         let decoder_expr = entry.decoder_expr;
         let instruction_type = entry.instruction_type;
 
-        let instruction_enum_ident = &instruction_type.path.segments.last().unwrap().ident;
+        let instruction_enum_ident = &instruction_type
+            .path
+            .segments
+            .last()
+            .expect("segment")
+            .ident;
         let instruction_type_ident = format_ident!("{}Type", instruction_enum_ident);
 
         instruction_variants.push(quote! {
@@ -739,7 +756,7 @@ pub fn instruction_decoder_collection(input: TokenStream) -> TokenStream {
 ///
 /// ```rust
 /// use carbon_proc_macros::InstructionType;
-/// 
+///
 /// #[derive(InstructionType)]
 /// enum Instructions {
 ///     NoData,
