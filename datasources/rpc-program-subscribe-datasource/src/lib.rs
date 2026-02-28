@@ -1,7 +1,7 @@
 use {
     async_trait::async_trait,
     carbon_core::{
-        datasource::{AccountUpdate, Datasource, Update, UpdateType},
+        datasource::{AccountUpdate, Datasource, DatasourceId, Update, UpdateType},
         error::CarbonResult,
         metrics::MetricsCollection,
     },
@@ -55,7 +55,8 @@ impl RpcProgramSubscribe {
 impl Datasource for RpcProgramSubscribe {
     async fn consume(
         &self,
-        sender: &Sender<Update>,
+        id: DatasourceId,
+        sender: Sender<(Update, DatasourceId)>,
         cancellation_token: CancellationToken,
         metrics: Arc<MetricsCollection>,
     ) -> CarbonResult<()> {
@@ -70,12 +71,11 @@ impl Datasource for RpcProgramSubscribe {
             let client = match PubsubClient::new(&self.rpc_ws_url).await {
                 Ok(client) => client,
                 Err(err) => {
-                    log::error!("Failed to create RPC subscribe client: {}", err);
+                    log::error!("Failed to create RPC subscribe client: {err}");
                     reconnection_attempts += 1;
                     if reconnection_attempts >= MAX_RECONNECTION_ATTEMPTS {
                         return Err(carbon_core::error::Error::Custom(format!(
-                            "Failed to create RPC subscribe client after {} attempts: {}",
-                            MAX_RECONNECTION_ATTEMPTS, err
+                            "Failed to create RPC subscribe client after {MAX_RECONNECTION_ATTEMPTS} attempts: {err}"
                         )));
                     }
                     tokio::time::sleep(Duration::from_millis(RECONNECTION_DELAY_MS)).await;
@@ -85,6 +85,7 @@ impl Datasource for RpcProgramSubscribe {
 
             let filters = self.filters.clone();
             let sender_clone = sender.clone();
+            let id_for_loop = id.clone();
 
             let (mut program_stream, _program_unsub) = match client
                 .program_subscribe(&filters.pubkey, filters.program_subscribe_config)
@@ -92,12 +93,11 @@ impl Datasource for RpcProgramSubscribe {
             {
                 Ok(subscription) => subscription,
                 Err(err) => {
-                    log::error!("Failed to subscribe to program updates: {:?}", err);
+                    log::error!("Failed to subscribe to program updates: {err:?}");
                     reconnection_attempts += 1;
                     if reconnection_attempts > MAX_RECONNECTION_ATTEMPTS {
                         return Err(carbon_core::error::Error::Custom(format!(
-                            "Failed to subscribe after {} attempts: {}",
-                            MAX_RECONNECTION_ATTEMPTS, err
+                            "Failed to subscribe after {MAX_RECONNECTION_ATTEMPTS} attempts: {err}"
                         )));
                     }
                     tokio::time::sleep(Duration::from_millis(RECONNECTION_DELAY_MS)).await;
@@ -134,6 +134,7 @@ impl Datasource for RpcProgramSubscribe {
                                     pubkey: account_pubkey,
                                     account: decoded_account,
                                     slot: acc_event.context.slot,
+                                    transaction_signature: None,
                                 });
 
                                 metrics
@@ -142,14 +143,14 @@ impl Datasource for RpcProgramSubscribe {
                                         start_time.elapsed().as_nanos() as f64
                                     )
                                     .await
-                                    .unwrap_or_else(|value| log::error!("Error recording metric: {}", value));
+                                    .unwrap_or_else(|value| log::error!("Error recording metric: {value}"));
 
                                 metrics.increment_counter("program_subscribe_accounts_processed", 1)
                                     .await
-                                    .unwrap_or_else(|value| log::error!("Error recording metric: {}", value));
+                                    .unwrap_or_else(|value| log::error!("Error recording metric: {value}"));
 
-                                if let Err(err) = sender_clone.try_send(update) {
-                                    log::error!("Error sending account update: {:?}", err);
+                                if let Err(err) = sender_clone.try_send((update, id_for_loop.clone())) {
+                                    log::error!("Error sending account update: {err:?}");
                                     break;
                                 }
                             }

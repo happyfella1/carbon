@@ -33,11 +33,13 @@
 //! - Ensure implementations handle errors gracefully, especially when fetching
 //!   data and sending updates to the pipeline.
 
+use solana_clock::Slot;
 use solana_program::hash::Hash;
 use solana_transaction_status::Rewards;
 use {
     crate::{error::CarbonResult, metrics::MetricsCollection},
     async_trait::async_trait,
+    chrono::{DateTime, Utc},
     solana_account::Account,
     solana_pubkey::Pubkey,
     solana_signature::Signature,
@@ -46,6 +48,16 @@ use {
     std::sync::Arc,
     tokio_util::sync::CancellationToken,
 };
+
+#[derive(Debug, Clone)]
+pub struct DatasourceDisconnection {
+    pub source: String,
+    pub disconnect_time: DateTime<Utc>,
+    pub last_slot_before_disconnect: Slot,
+    pub first_slot_after_reconnect: Slot,
+    /// Number of slots missed during disconnection
+    pub missed_slots: u64,
+}
 
 /// Defines the interface for data sources that produce updates for accounts,
 /// transactions, and account deletions.
@@ -102,12 +114,98 @@ use {
 pub trait Datasource: Send + Sync {
     async fn consume(
         &self,
-        sender: &tokio::sync::mpsc::Sender<Update>,
+        id: DatasourceId,
+        sender: tokio::sync::mpsc::Sender<(Update, DatasourceId)>,
         cancellation_token: CancellationToken,
         metrics: Arc<MetricsCollection>,
     ) -> CarbonResult<()>;
 
     fn update_types(&self) -> Vec<UpdateType>;
+}
+
+/// A unique identifier for a datasource in the pipeline.
+///
+/// Datasource IDs are used to track the source of data updates and enable
+/// filtering of updates based on their origin. This is particularly useful
+/// when you have multiple datasources and want to process updates selectively.
+///
+/// # Examples
+///
+/// Creating a datasource with a unique ID:
+/// ```
+/// use carbon_core::datasource::DatasourceId;
+///
+/// let id = DatasourceId::new_unique();
+/// println!("Generated ID: {:?}", id);
+/// ```
+///
+/// Creating a datasource with a named ID:
+/// ```
+/// use carbon_core::datasource::DatasourceId;
+///
+/// let id = DatasourceId::new_named("mainnet-rpc");
+/// println!("Named ID: {:?}", id);
+/// ```
+///
+/// Using with filters:
+/// ```
+/// use carbon_core::{datasource::DatasourceId, filter::DatasourceFilter};
+///
+/// let datasource_id = DatasourceId::new_named("testnet");
+/// let filter = DatasourceFilter::new(datasource_id);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DatasourceId(String);
+
+impl DatasourceId {
+    /// Creates a new datasource ID with a randomly generated unique identifier.
+    ///
+    /// This method uses a cryptographically secure random number generator
+    /// to create a unique ID. The ID is converted to a string representation
+    /// for easy debugging and logging.
+    ///
+    /// # Returns
+    ///
+    /// A new `DatasourceId` with a unique random identifier.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use carbon_core::datasource::DatasourceId;
+    ///
+    /// let id1 = DatasourceId::new_unique();
+    /// let id2 = DatasourceId::new_unique();
+    /// assert_ne!(id1, id2); // IDs should be different
+    /// ```
+    pub fn new_unique() -> Self {
+        Self(uuid::Uuid::new_v4().to_string())
+    }
+
+    /// Creates a new datasource ID with a specific name.
+    ///
+    /// This method is useful when you want to assign a meaningful name
+    /// to a datasource for easier identification and debugging.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - A string slice containing the name for the datasource ID
+    ///
+    /// # Returns
+    ///
+    /// A new `DatasourceId` with the specified name.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use carbon_core::datasource::DatasourceId;
+    ///
+    /// let mainnet_id = DatasourceId::new_named("mainnet-rpc");
+    /// let testnet_id = DatasourceId::new_named("testnet-rpc");
+    /// assert_ne!(mainnet_id, testnet_id);
+    /// ```
+    pub fn new_named(name: &str) -> Self {
+        Self(name.to_string())
+    }
 }
 
 /// Represents a data update in the `carbon-core` pipeline, encompassing
@@ -149,11 +247,13 @@ pub enum UpdateType {
 /// - `pubkey`: The public key of the account being updated.
 /// - `account`: The new state of the account.
 /// - `slot`: The slot number in which this account update was recorded.
+/// - `transaction_signature`: Signature of the transaction that caused the update.
 #[derive(Debug, Clone)]
 pub struct AccountUpdate {
     pub pubkey: Pubkey,
     pub account: Account,
     pub slot: u64,
+    pub transaction_signature: Option<Signature>,
 }
 
 /// Represents the details of a Solana block, including its slot, hashes, rewards, and timing information.
@@ -188,10 +288,12 @@ pub struct BlockDetails {
 ///
 /// - `pubkey`: The public key of the deleted account.
 /// - `slot`: The slot number in which the account was deleted.
+/// - `transaction_signature`: Signature of the transaction that caused the update.
 #[derive(Debug, Clone)]
 pub struct AccountDeletion {
     pub pubkey: Pubkey,
     pub slot: u64,
+    pub transaction_signature: Option<Signature>,
 }
 
 /// Represents a transaction update in the Solana network, including transaction
@@ -209,10 +311,11 @@ pub struct AccountDeletion {
 ///   and logs.
 /// - `is_vote`: A boolean indicating whether the transaction is a vote.
 /// - `slot`: The slot number in which the transaction was recorded.
+/// - `index`: The index of the transaction within the slot (block).
 /// - `block_time`: The Unix timestamp of when the transaction was processed.
 /// - `block_hash`: Block hash that can be used to detect a fork.
 ///
-/// Note: The `block_time` field may not be returned in all scenarios.
+/// Note: The `block_time` and `index` fields may not be available in all scenarios.
 #[derive(Debug, Clone)]
 pub struct TransactionUpdate {
     pub signature: Signature,
@@ -220,6 +323,7 @@ pub struct TransactionUpdate {
     pub meta: TransactionStatusMeta,
     pub is_vote: bool,
     pub slot: u64,
+    pub index: Option<u64>,
     pub block_time: Option<i64>,
     pub block_hash: Option<Hash>,
 }

@@ -2,7 +2,9 @@ use super::super::types::*;
 
 use carbon_core::{borsh, CarbonDeserialize};
 
-#[derive(CarbonDeserialize, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(
+    CarbonDeserialize, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq, Clone, Hash,
+)]
 #[carbon(discriminator = "0xf7ede3f5d7c3de46")]
 pub struct PoolState {
     pub epoch: u64,
@@ -29,5 +31,8 @@ pub struct PoolState {
     pub base_vault: solana_pubkey::Pubkey,
     pub quote_vault: solana_pubkey::Pubkey,
     pub creator: solana_pubkey::Pubkey,
-    pub padding: [u64; 8],
+    pub token_program_flag: u8,
+    pub amm_creator_fee_on: AmmCreatorFeeOn,
+    #[serde(with = "serde_big_array::BigArray")]
+    pub padding: [u8; 62],
 }

@@ -51,9 +51,12 @@
 //!   handling in the pipeline.
 
 use {
-    crate::{error::CarbonResult, metrics::MetricsCollection, processor::Processor},
+    crate::{
+        error::CarbonResult, filter::Filter, metrics::MetricsCollection, processor::Processor,
+    },
     async_trait::async_trait,
     solana_pubkey::Pubkey,
+    solana_signature::Signature,
     std::sync::Arc,
 };
 
@@ -68,10 +71,12 @@ use {
 ///
 /// - `slot`: The Solana slot number where the account was updated.
 /// - `pubkey`: The public key of the account.
+/// - `transaction_signature`: Signature of the transaction that caused the update.
 #[derive(Debug, Clone)]
 pub struct AccountMetadata {
     pub slot: u64,
     pub pubkey: Pubkey,
+    pub transaction_signature: Option<Signature>,
 }
 
 /// Represents the decoded data of a Solana account, including account-specific
@@ -125,7 +130,8 @@ pub trait AccountDecoder<'a> {
 /// The input type for the account processor.
 ///
 /// - `T`: The account type, as determined by the decoder.
-pub type AccountProcessorInputType<T> = (AccountMetadata, DecodedAccount<T>);
+pub type AccountProcessorInputType<T> =
+    (AccountMetadata, DecodedAccount<T>, solana_account::Account);
 
 /// A processing pipe that decodes and processes Solana account updates.
 ///
@@ -145,45 +151,26 @@ pub type AccountProcessorInputType<T> = (AccountMetadata, DecodedAccount<T>);
 ///   structured form.
 /// - `processor`: A `Processor` that handles the processing logic for decoded
 ///   accounts.
+/// - `filters`: A collection of filters that determine which account updates
+///   should be processed. Each filter in this collection is applied to incoming
+///   account updates, and only updates that pass all filters (return `true`)
+///   will be processed. If this collection is empty, all updates are processed.
 pub struct AccountPipe<T: Send> {
     pub decoder: Box<dyn for<'a> AccountDecoder<'a, AccountType = T> + Send + Sync + 'static>,
     pub processor: Box<dyn Processor<InputType = AccountProcessorInputType<T>> + Send + Sync>,
+    pub filters: Vec<Box<dyn Filter + Send + Sync + 'static>>,
 }
 
-/// A trait for processing account updates in the pipeline asynchronously.
+/// An async trait for processing account updates.
 ///
-/// `AccountPipes` defines the `run` method for processing account updates in
-/// the pipeline. Implementations should handle the decoding and processing of
-/// the account data, and update metrics as needed.
+/// The `AccountPipes` trait allows for processing of account updates.
 ///
-/// # Example
+/// # Required Methods
 ///
-/// ```ignore
-/// use carbon_core::error::CarbonResult;
-/// use carbon_core::metrics::MetricsCollection;
-/// use carbon_core::account::AccountMetadata;
-/// use carbon_core::account::AccountPipes;
-/// use std::sync::Arc;
-/// use async_trait::async_trait;
-///
-/// #[async_trait]
-/// impl AccountPipes for MyAccountPipe {
-///     async fn run(
-///         &mut self,
-///         account_with_metadata: (AccountMetadata, solana_account::Account),
-///         metrics: Arc<MetricsCollection>,
-///     ) -> CarbonResult<()> {
-///         // Custom processing logic here
-///         Ok(())
-///     }
-/// }
-/// ```
-///
-/// # Parameters
-///
-/// - `account_with_metadata`: A tuple containing account metadata and the
-///   Solana account data.
-/// - `metrics`: A list of `Metrics` objects for recording and tracking metrics.
+/// - `run`: Processes an account update and tracks the operation with metrics.
+/// - `filters`: Returns a reference to the filters associated with this pipe,
+///   which are used by the pipeline to determine which account updates should
+///   be processed.
 #[async_trait]
 pub trait AccountPipes: Send + Sync {
     async fn run(
@@ -191,6 +178,8 @@ pub trait AccountPipes: Send + Sync {
         account_with_metadata: (AccountMetadata, solana_account::Account),
         metrics: Arc<MetricsCollection>,
     ) -> CarbonResult<()>;
+
+    fn filters(&self) -> &Vec<Box<dyn Filter + Send + Sync + 'static>>;
 }
 
 #[async_trait]
@@ -200,16 +189,24 @@ impl<T: Send> AccountPipes for AccountPipe<T> {
         account_with_metadata: (AccountMetadata, solana_account::Account),
         metrics: Arc<MetricsCollection>,
     ) -> CarbonResult<()> {
-        log::trace!(
-            "AccountPipe::run(account_with_metadata: {:?}, metrics)",
-            account_with_metadata,
-        );
+        log::trace!("AccountPipe::run(account_with_metadata: {account_with_metadata:?}, metrics)",);
 
         if let Some(decoded_account) = self.decoder.decode_account(&account_with_metadata.1) {
             self.processor
-                .process((account_with_metadata.0, decoded_account), metrics)
+                .process(
+                    (
+                        account_with_metadata.0.clone(),
+                        decoded_account,
+                        account_with_metadata.1,
+                    ),
+                    metrics.clone(),
+                )
                 .await?;
         }
         Ok(())
+    }
+
+    fn filters(&self) -> &Vec<Box<dyn Filter + Send + Sync + 'static>> {
+        &self.filters
     }
 }

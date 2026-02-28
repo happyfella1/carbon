@@ -2,10 +2,10 @@ use {
     async_trait::async_trait,
     carbon_core::{
         account::AccountProcessorInputType,
-        datasource::{AccountUpdate, Datasource, Update, UpdateType},
+        datasource::{AccountUpdate, Datasource, DatasourceId, Update, UpdateType},
         error::CarbonResult,
         instruction::InstructionDecoder,
-        instruction_decoder_collection,
+        instruction_decoder_collection_fast,
         metrics::MetricsCollection,
         pipeline::{Pipeline, ShutdownStrategy},
         processor::Processor,
@@ -17,6 +17,7 @@ use {
         instructions::{SharkyInstruction, SharkyInstructionType},
         SharkyDecoder, PROGRAM_ID as SHARKY_PROGRAM_ID,
     },
+    solana_account::Account,
     solana_account_decoder::UiAccountEncoding,
     solana_client::{
         nonblocking::rpc_client::RpcClient,
@@ -52,7 +53,8 @@ impl GpaBackfillDatasource {
 impl Datasource for GpaBackfillDatasource {
     async fn consume(
         &self,
-        sender: &Sender<Update>,
+        id: DatasourceId,
+        sender: Sender<(Update, DatasourceId)>,
         _cancellation_token: CancellationToken,
         _metrics: Arc<MetricsCollection>,
     ) -> CarbonResult<()> {
@@ -67,10 +69,17 @@ impl Datasource for GpaBackfillDatasource {
         let program_accounts = match &self.config {
             Some(config) => {
                 rpc_client
-                    .get_program_accounts_with_config(&self.program_id, config.clone())
+                    .get_program_ui_accounts_with_config(&self.program_id, config.clone())
                     .await
             }
-            None => rpc_client.get_program_accounts(&self.program_id).await,
+            None => {
+                rpc_client
+                    .get_program_ui_accounts_with_config(
+                        &self.program_id,
+                        RpcProgramAccountsConfig::default(),
+                    )
+                    .await
+            }
         };
 
         let Ok(program_accounts) = program_accounts else {
@@ -79,13 +88,21 @@ impl Datasource for GpaBackfillDatasource {
             ));
         };
 
+        let id_for_loop = id.clone();
+
         for (pubkey, account) in program_accounts {
-            if let Err(e) = sender.try_send(Update::Account(AccountUpdate {
-                pubkey,
-                account,
-                slot,
-            })) {
-                log::error!("Failed to send account update: {:?}", e);
+            if let Some(account) = account.decode::<Account>() {
+                if let Err(e) = sender.try_send((
+                    Update::Account(AccountUpdate {
+                        pubkey,
+                        account,
+                        slot,
+                        transaction_signature: None,
+                    }),
+                    id_for_loop.clone(),
+                )) {
+                    log::error!("Failed to send account update: {e:?}");
+                }
             }
         }
 
@@ -108,7 +125,7 @@ impl Processor for SharkyAccountProcessor {
         update: Self::InputType,
         _metrics: Arc<MetricsCollection>,
     ) -> CarbonResult<()> {
-        let (_metadata, account) = update;
+        let (_metadata, account, _raw_account) = update;
 
         match account.data {
             SharkyAccount::OrderBook(order_book) => {
@@ -124,15 +141,15 @@ impl Processor for SharkyAccountProcessor {
     }
 }
 
-instruction_decoder_collection!(
+instruction_decoder_collection_fast!(
     AllInstructions, AllInstructionsType, AllPrograms,
-    Sharky => SharkyDecoder => SharkyInstruction
+    Sharky => carbon_sharky_decoder::PROGRAM_ID => SharkyDecoder => SharkyInstruction
 );
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    env_logger::init();
     dotenv::dotenv().ok();
+    env_logger::init();
 
     Pipeline::builder()
         .datasource(GpaBackfillDatasource::new(

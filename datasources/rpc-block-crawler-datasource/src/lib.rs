@@ -1,3 +1,4 @@
+use carbon_core::datasource::DatasourceId;
 pub use solana_client::rpc_config::RpcBlockConfig;
 use solana_hash::Hash;
 use std::str::FromStr;
@@ -66,7 +67,8 @@ impl RpcBlockCrawler {
 impl Datasource for RpcBlockCrawler {
     async fn consume(
         &self,
-        sender: &Sender<Update>,
+        id: DatasourceId,
+        sender: Sender<(Update, DatasourceId)>,
         cancellation_token: CancellationToken,
         metrics: Arc<MetricsCollection>,
     ) -> CarbonResult<()> {
@@ -76,7 +78,6 @@ impl Datasource for RpcBlockCrawler {
                 .commitment
                 .unwrap_or(CommitmentConfig::confirmed()),
         ));
-        let sender = sender.clone();
         let (block_sender, block_receiver) = mpsc::channel(self.channel_buffer_size);
 
         let block_fetcher = block_fetcher(
@@ -94,6 +95,7 @@ impl Datasource for RpcBlockCrawler {
         let task_processor = task_processor(
             block_receiver,
             sender,
+            id,
             cancellation_token.clone(),
             metrics.clone(),
         );
@@ -143,16 +145,14 @@ fn block_fetcher(
                                     latest_slot = slot;
                                     if current_slot > latest_slot {
                                         log::debug!(
-                                            "Waiting for new blocks... Current: {}, Latest: {}",
-                                            current_slot,
-                                            latest_slot
+                                            "Waiting for new blocks... Current: {current_slot}, Latest: {latest_slot}"
                                         );
                                         tokio::time::sleep(block_interval).await;
                                         continue;
                                     }
                                 }
                                 Err(e) => {
-                                    log::error!("Error fetching latest slot: {:?}", e);
+                                    log::error!("Error fetching latest slot: {e:?}");
                                     tokio::time::sleep(block_interval).await;
                                     continue;
                                 }
@@ -189,14 +189,14 @@ fn block_fetcher(
                                     )
                                     .await
                                     .unwrap_or_else(|value| {
-                                        log::error!("Error recording metric: {}", value)
+                                        log::error!("Error recording metric: {value}")
                                     });
 
                                 metrics
                                     .increment_counter("block_crawler_blocks_fetched", 1)
                                     .await
                                     .unwrap_or_else(|value| {
-                                        log::error!("Error recording metric: {}", value)
+                                        log::error!("Error recording metric: {value}")
                                     });
 
                                 Some((slot, block))
@@ -215,10 +215,10 @@ fn block_fetcher(
                                         .increment_counter("block_crawler_blocks_skipped", 1)
                                         .await
                                         .unwrap_or_else(|value| {
-                                            log::error!("Error recording metric: {}", value)
+                                            log::error!("Error recording metric: {value}")
                                         });
                                 } else {
-                                    log::error!("Error fetching block at slot {}: {:?}", slot, e);
+                                    log::error!("Error fetching block at slot {slot}: {e:?}");
                                 }
                                 None
                             }
@@ -229,7 +229,7 @@ fn block_fetcher(
                 .for_each(|result| async {
                     if let Some((slot, block)) = result {
                         if let Err(e) = block_sender.send((slot, block)).await {
-                            log::error!("Failed to send block: {:?}", e);
+                            log::error!("Failed to send block: {e:?}");
                         }
                     }
                 })
@@ -248,94 +248,104 @@ fn block_fetcher(
 /// Process the block and send the transactions to the sender
 fn task_processor(
     block_receiver: Receiver<(u64, UiConfirmedBlock)>,
-    sender: Sender<Update>,
+    sender: Sender<(Update, DatasourceId)>,
+    id: DatasourceId,
     cancellation_token: CancellationToken,
     metrics: Arc<MetricsCollection>,
 ) -> JoinHandle<()> {
     let mut block_receiver = block_receiver;
     let sender = sender.clone();
+    let id_for_loop = id.clone();
 
     tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = cancellation_token.cancelled() => {
-                    log::info!("Cancelling RPC Crawler task processor...");
-                    break;
-                }
-                Some((slot, block)) = block_receiver.recv() => {
-                    metrics
-                        .increment_counter("block_crawler_blocks_received", 1)
-                        .await
-                        .unwrap_or_else(|value| {
-                            log::error!("Error recording metric: {}", value)
-                        });
-                    let block_start_time = Instant::now();
-                    let block_hash = Hash::from_str(&block.blockhash).ok();
-                    if let Some(transactions) = block.transactions {
-                        for encoded_transaction_with_status_meta in transactions {
-                            let start_time = std::time::Instant::now();
+            _ = cancellation_token.cancelled() => {
+                log::info!("Cancelling RPC Crawler task processor...");
+                break;
+            }
+            maybe_block = block_receiver.recv() => {
+                match maybe_block {
+                    Some((slot, block)) => {
 
-                            let meta_original = if let Some(meta) = encoded_transaction_with_status_meta.clone().meta {
-                                meta
-                            } else {
-                                continue;
-                            };
+                        metrics
+                            .increment_counter("block_crawler_blocks_received", 1)
+                            .await
+                            .unwrap_or_else(|value| {
+                                log::error!("Error recording metric: {value}")
+                            });
+                        let block_start_time = Instant::now();
+                        let block_hash = Hash::from_str(&block.blockhash).ok();
+                        if let Some(transactions) = block.transactions {
+                            for (tx_index, encoded_transaction_with_status_meta) in transactions.into_iter().enumerate() {
+                                let start_time = std::time::Instant::now();
 
-                            if meta_original.status.is_err() {
-                                continue;
-                            }
+                                let meta_original = if let Some(meta) = encoded_transaction_with_status_meta.clone().meta {
+                                    meta
+                                } else {
+                                    continue;
+                                };
 
-                            let Some(decoded_transaction) = encoded_transaction_with_status_meta.transaction.decode() else {
-                                log::error!("Failed to decode transaction: {:?}", encoded_transaction_with_status_meta);
-                                continue;
-                            };
+                                if meta_original.status.is_err() {
+                                    continue;
+                                }
 
-                            let Ok(meta_needed) = transaction_metadata_from_original_meta(meta_original) else {
-                                log::error!("Error getting metadata from transaction original meta.");
-                                continue;
-                            };
+                                let Some(decoded_transaction) = encoded_transaction_with_status_meta.transaction.decode() else {
+                                    log::error!("Failed to decode transaction: {encoded_transaction_with_status_meta:?}");
+                                    continue;
+                                };
 
-                            let update = Update::Transaction(Box::new(TransactionUpdate {
-                                signature: *decoded_transaction.get_signature(),
-                                transaction: decoded_transaction.clone(),
-                                meta: meta_needed,
-                                is_vote: false,
-                                slot,
-                                block_time: block.block_time,
-                                block_hash,
-                            }));
+                                let Ok(meta_needed) = transaction_metadata_from_original_meta(meta_original) else {
+                                    log::error!("Error getting metadata from transaction original meta.");
+                                    continue;
+                                };
 
-                            metrics
-                                .record_histogram(
-                                    "block_crawler_transaction_process_time_nanoseconds",
-                                    start_time.elapsed().as_nanos() as f64
-                                )
-                                .await
-                                .unwrap_or_else(|value| log::error!("Error recording metric: {}", value));
+                                let update = Update::Transaction(Box::new(TransactionUpdate {
+                                    signature: *decoded_transaction.get_signature(),
+                                    transaction: decoded_transaction.clone(),
+                                    meta: meta_needed,
+                                    is_vote: false,
+                                    slot,
+                                    index: Some(tx_index as u64),
+                                    block_time: block.block_time,
+                                    block_hash,
+                                }));
 
-                            metrics.increment_counter("block_crawler_transactions_processed", 1)
-                                .await
-                                .unwrap_or_else(|value| log::error!("Error recording metric: {}", value));
+                                metrics
+                                    .record_histogram(
+                                        "block_crawler_transaction_process_time_nanoseconds",
+                                        start_time.elapsed().as_nanos() as f64
+                                    )
+                                    .await
+                                    .unwrap_or_else(|value| log::error!("Error recording metric: {value}"));
 
-                            if let Err(err) = sender.try_send(update) {
-                                log::error!("Error sending transaction update: {:?}", err);
-                                break;
+                                metrics.increment_counter("block_crawler_transactions_processed", 1)
+                                    .await
+                                    .unwrap_or_else(|value| log::error!("Error recording metric: {value}"));
+
+                                if let Err(err) = sender.try_send((update, id_for_loop.clone())) {
+                                    log::error!("Error sending transaction update: {err:?}");
+                                    break;
+                                }
                             }
                         }
-                    }
-                    metrics
-                        .record_histogram(
-                            "block_crawler_block_process_time_nanoseconds",
-                            block_start_time.elapsed().as_nanos() as f64
-                        ).await
-                        .unwrap_or_else(|value| log::error!("Error recording metric: {}", value));
+                        metrics
+                            .record_histogram(
+                                "block_crawler_block_process_time_nanoseconds",
+                                block_start_time.elapsed().as_nanos() as f64
+                            ).await
+                            .unwrap_or_else(|value| log::error!("Error recording metric: {value}"));
 
-                    metrics
-                        .increment_counter("block_crawler_blocks_processed", 1)
-                        .await
-                        .unwrap_or_else(|value| log::error!("Error recording metric: {}", value));
+                        metrics
+                            .increment_counter("block_crawler_blocks_processed", 1)
+                            .await
+                            .unwrap_or_else(|value| log::error!("Error recording metric: {value}"));
+                    }
+                    None => {
+                        break;
+                    }
                 }
-            }
+            }}
         }
     })
 }
@@ -458,7 +468,7 @@ mod tests {
             let mut received_blocks = Vec::new();
 
             while let Some((slot, block)) = block_receiver.recv().await {
-                println!("Received block at slot {}", slot);
+                println!("Received block at slot {slot}");
                 received_blocks.push((slot, block));
 
                 if received_blocks.len() == 2 {

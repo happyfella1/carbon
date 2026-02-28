@@ -33,6 +33,12 @@
 //! - **[`error`]**: Defines error types used throughout the crate, providing
 //!   consistent error handling for the framework.
 //!
+//! - **[`filter`]**: Provides a flexible filtering system that allows selective
+//!   processing of updates based on various criteria such as datasource ID,
+//!   update content, or custom logic. Filters can be applied to different
+//!   types of updates (accounts, instructions, transactions, account deletions,
+//!   and block details) to control which updates are processed by specific pipes.
+//!
 //! - **[`instruction`]**: Supports instruction parsing and processing within
 //!   transactions. This module includes structures and traits for decoding and
 //!   handling transaction instructions.
@@ -45,6 +51,11 @@
 //!   pipeline structure that manages data flow and processing. The pipeline
 //!   integrates data sources, processing pipes, and metrics to provide a
 //!   complete data processing solution.
+//!
+//! - **[`postgres`]**: Provides support for PostgreSQL database operations,
+//!   including table definitions, insert, upsert, and delete operations.
+//!   This module is designed to be used in conjunction with the `sqlx` crate
+//!   for database interactions.
 //!
 //! - **[`processor`]**: Contains traits and implementations for processing data
 //!   in the pipeline. This module allows for the creation of custom data
@@ -114,14 +125,20 @@
 
 pub mod account;
 pub mod account_deletion;
+pub mod account_utils;
 mod block_details;
 pub mod collection;
 pub mod datasource;
 pub mod deserialize;
 pub mod error;
+pub mod filter;
+#[cfg(feature = "graphql")]
+pub mod graphql;
 pub mod instruction;
 pub mod metrics;
 pub mod pipeline;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 pub mod processor;
 pub mod schema;
 pub mod transaction;

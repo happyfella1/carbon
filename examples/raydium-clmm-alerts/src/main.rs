@@ -19,8 +19,8 @@ use {
 
 #[tokio::main]
 pub async fn main() -> CarbonResult<()> {
-    env_logger::init();
     dotenv::dotenv().ok();
+    env_logger::init();
 
     let filters = Filters::new(
         RpcBlockSubscribeFilter::MentionsAccountOrProgram(RAYDIUM_CLMM_PROGRAM_ID.to_string()),
@@ -33,7 +33,7 @@ pub async fn main() -> CarbonResult<()> {
     let rpc_ws_url =
         env::var("RPC_WS_URL").unwrap_or("wss://api.mainnet-beta.solana.com/".to_string());
 
-    log::info!("Starting with RPC: {}", rpc_ws_url);
+    log::info!("Starting with RPC: {rpc_ws_url}");
     let block_subscribe = RpcBlockSubscribe::new(rpc_ws_url, filters);
 
     carbon_core::pipeline::Pipeline::builder()
@@ -57,11 +57,12 @@ impl Processor for RaydiumClmmInstructionProcessor {
         InstructionMetadata,
         DecodedInstruction<RaydiumClmmInstruction>,
         NestedInstructions,
+        solana_instruction::Instruction,
     );
 
     async fn process(
         &mut self,
-        (metadata, instruction, _nested_instructions): Self::InputType,
+        (metadata, instruction, _nested_instructions, _): Self::InputType,
         _metrics: Arc<MetricsCollection>,
     ) -> CarbonResult<()> {
         let signature = metadata.transaction_metadata.signature;

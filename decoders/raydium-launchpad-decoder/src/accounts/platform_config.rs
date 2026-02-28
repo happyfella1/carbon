@@ -1,6 +1,11 @@
+use super::super::types::*;
+
+use alloc::vec::Vec;
 use carbon_core::{borsh, CarbonDeserialize};
 
-#[derive(CarbonDeserialize, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(
+    CarbonDeserialize, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq, Clone, Hash,
+)]
 #[carbon(discriminator = "0xa04e8000f853e6a0")]
 pub struct PlatformConfig {
     pub epoch: u64,
@@ -16,6 +21,10 @@ pub struct PlatformConfig {
     pub web: [u8; 256],
     #[serde(with = "serde_big_array::BigArray")]
     pub img: [u8; 256],
+    pub cpswap_config: solana_pubkey::Pubkey,
+    pub creator_fee_rate: u64,
+    pub transfer_fee_extension_auth: solana_pubkey::Pubkey,
     #[serde(with = "serde_big_array::BigArray")]
-    pub padding: [u8; 256],
+    pub padding: [u8; 180],
+    pub curve_params: Vec<PlatformCurveParam>,
 }
